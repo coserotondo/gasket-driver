@@ -53,12 +53,10 @@
 #include <linux/version.h>
 #include <linux/vmalloc.h>
 
-#if __has_include(<linux/dma-buf.h>)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("DMA_BUF");
 #else
 MODULE_IMPORT_NS(DMA_BUF);
-#endif
 #endif
 
 #include "gasket_constants.h"
@@ -489,8 +487,12 @@ static bool gasket_release_page(struct page *page)
 		return false;
 
 	if (!PageReserved(page))
-		SetPageDirty(page);
+		set_page_dirty_lock(page);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+	unpin_user_page(page);
+#else
 	put_page(page);
+#endif
 
 	return true;
 }
@@ -506,7 +508,7 @@ static bool gasket_release_page(struct page *page)
 static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
 				  struct gasket_page_table_entry *ptes,
 				  u64 __iomem *slots,
-				  struct sg_page_iter *sg_iter,
+				  struct sg_dma_page_iter *sg_iter,
 				  ulong host_addr,
 				  uint num_pages, u32 flags,
 				  int is_simple_mapping)
@@ -537,16 +539,11 @@ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
 		offset = page_addr & (PAGE_SIZE - 1);
 		dev_dbg(pg_tbl->device, "%s i %d\n", __func__, i);
 		if (sg_iter) {
-			if (!__sg_page_iter_next(sg_iter))
+			if (!__sg_page_iter_next(&sg_iter->base))
 				return -EINVAL;
 
 			/* Page already mapped for DMA. */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0)
 			ptes[i].dma_addr = sg_page_iter_dma_address(sg_iter);
-#else
-			ptes[i].dma_addr = sg_page_iter_dma_address(
-				container_of(sg_iter, struct sg_dma_page_iter, base));
-#endif
 			ptes[i].page = NULL;
 			offset = 0;
 		} else if (is_coherent(pg_tbl, host_addr)) {
@@ -558,13 +555,20 @@ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
 			ptes[i].dma_addr = pg_tbl->coherent_pages[0].paddr +
 					   off + i * PAGE_SIZE;
 		} else {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+			ret = pin_user_pages_fast(page_addr - offset, 1,
+						  FOLL_LONGTERM |
+						  (direction != DMA_TO_DEVICE ? FOLL_WRITE : 0),
+						  &page);
+#else
 			ret = get_user_pages_fast(page_addr - offset, 1,
 						  direction != DMA_TO_DEVICE,
 						  &page);
+#endif
 
 			if (ret <= 0) {
 				dev_err(pg_tbl->device,
-					"get user pages failed for addr=0x%lx, "
+					"get/pin user pages failed for addr=0x%lx, "
 					"offset=0x%lx [ret=%d]\n",
 					page_addr, offset, ret);
 				return ret ? ret : -ENOMEM;
@@ -901,7 +905,7 @@ static void gasket_page_table_unmap_nolock(struct gasket_page_table *pg_tbl,
  * If there is an error, no pages are mapped.
  */
 static int gasket_map_simple_pages(struct gasket_page_table *pg_tbl,
-				   struct sg_page_iter *sg_iter,
+				   struct sg_dma_page_iter *sg_iter,
 				   ulong host_addr, u64 dev_addr,
 				   uint num_pages, u32 flags)
 {
@@ -1049,7 +1053,7 @@ static int gasket_alloc_extended_entries(struct gasket_page_table *pg_tbl,
  * If there is an error, no pages are mapped.
  */
 static int gasket_map_extended_pages(struct gasket_page_table *pg_tbl,
-				     struct sg_page_iter *sg_iter,
+				     struct sg_dma_page_iter *sg_iter,
 				     ulong host_addr, u64 dev_addr,
 				     uint num_pages, u32 flags)
 {
@@ -1174,7 +1178,7 @@ int gasket_page_table_map_dmabuf(struct gasket_page_table *pg_tbl, int fd,
 	struct dma_buf *dmabuf = NULL;
 	struct dma_buf_attachment *attachment = NULL;
 	struct sg_table *sgt = NULL;
-	struct sg_page_iter sg_iter;
+	struct sg_dma_page_iter sg_iter;
 	struct gasket_dmabuf_mapping *mapping = NULL;
 	enum dma_data_direction direction = GET(FLAGS_DMA_DIRECTION, flags);
 
@@ -1206,7 +1210,11 @@ int gasket_page_table_map_dmabuf(struct gasket_page_table *pg_tbl, int fd,
 		goto out;
 	}
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+	sgt = dma_buf_map_attachment_unlocked(attachment, direction);
+#else
 	sgt = dma_buf_map_attachment(attachment, direction);
+#endif
 	if (IS_ERR(sgt)) {
 		ret = PTR_ERR(sgt);
 		goto out;
@@ -1215,7 +1223,7 @@ int gasket_page_table_map_dmabuf(struct gasket_page_table *pg_tbl, int fd,
 	mutex_lock(&pg_tbl->mutex);
 	locked = 1;
 
-	__sg_page_iter_start(&sg_iter, sgt->sgl, sgt->nents, 0);
+	__sg_page_iter_start(&sg_iter.base, sgt->sgl, sgt->nents, 0);
 	if (gasket_addr_is_simple(pg_tbl, dev_addr)) {
 		ret = gasket_map_simple_pages(pg_tbl, &sg_iter, 0, dev_addr,
 					      num_pages, flags);
@@ -1241,8 +1249,13 @@ out:
 	if (locked)
 		mutex_unlock(&pg_tbl->mutex);
 
-	if (!IS_ERR_OR_NULL(sgt))
+	if (!IS_ERR_OR_NULL(sgt)) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+		dma_buf_unmap_attachment_unlocked(attachment, sgt, direction);
+#else
 		dma_buf_unmap_attachment(attachment, sgt, direction);
+#endif
+	}
 
 	if (!IS_ERR_OR_NULL(attachment))
 		dma_buf_detach(dmabuf, attachment);
@@ -1262,9 +1275,15 @@ static void gasket_page_table_detach_dmabuf_nolock(struct gasket_page_table *pg_
 
 	list_for_each_entry_safe(mapping, tmp, &pg_tbl->dmabufs, list) {
 		if (!dmabuf || mapping->dmabuf == dmabuf) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+			dma_buf_unmap_attachment_unlocked(mapping->attachment,
+							  mapping->sgt,
+							  mapping->direction);
+#else
 			dma_buf_unmap_attachment(mapping->attachment,
 						 mapping->sgt,
 						 mapping->direction);
+#endif
 			dma_buf_detach(mapping->dmabuf, mapping->attachment);
 			dma_buf_put(mapping->dmabuf);
 			list_del(&mapping->list);

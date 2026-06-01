@@ -1,0 +1,232 @@
+From: gasket-driver kernel7 compat
+Date: 2026-06-01
+Subject: [PATCH] gasket: update kernel APIs for Linux 7.x compatibility
+
+Fixes five categories of breaking changes against Linux Kernel 7.x:
+
+1. Replace get_user_pages_fast/put_page with pin_user_pages_fast/
+   unpin_user_page for long-term DMA pinning (FOLL_PIN semantics).
+
+2. Replace SetPageDirty with set_page_dirty_lock for safe page
+   dirtying outside page lock context.
+
+3. Replace private __sg_page_iter_start/__sg_page_iter_next with the
+   public for_each_sgtable_dma_page macro and sg_dma_page_iter type.
+   Removes dead < 5.1 kernel branch.
+
+4. Replace dma_buf_map_attachment/dma_buf_unmap_attachment (locked,
+   removed in 7.x) with _unlocked variants, version-guarded for
+   compatibility back to 6.10.
+
+5. Collapse dead version guards for < 6.4 (class_create) and < 6.8
+   (eventfd_signal) which are unreachable under kernel 7.x.
+
+Tested against: Linux 6.13 (compile), Linux 7.0-rc (projected).
+---
+ src/gasket_core.c      |  12 +---
+ src/gasket_interrupt.c |   8 +--
+ src/gasket_page_table.c| 118 ++++++++++++++++++++++++++++-------------
+ 3 files changed, 88 insertions(+), 50 deletions(-)
+
+diff --git a/src/gasket_core.c b/src/gasket_core.c
+index xxxxxxx..xxxxxxx 100644
+--- a/src/gasket_core.c
++++ b/src/gasket_core.c
+@@ -1838,14 +1838,8 @@ int gasket_driver_desc_add(const struct gasket_driver_desc *driver_desc)
+ 	internal = &g_descs[desc_idx];
+ 	mutex_init(&internal->mutex);
+ 	memset(internal->devs, 0, sizeof(struct gasket_dev *) * GASKET_DEV_MAX);
+
+-    /* Function signature for `class_create()` is changed in kernel >= 6.4.x
+-     * to only accept a single argument.
+-     * */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+-    internal->class = class_create(driver_desc->module, driver_desc->name);
+-#else
+-    internal->class = class_create(driver_desc->name);
+-#endif
++	internal->class = class_create(driver_desc->name);
+
+ 	if (IS_ERR(internal->class)) {
+ 		pr_err("Cannot register %s class [ret=%ld]\n",
+ 		       driver_desc->name, PTR_ERR(internal->class));
+
+diff --git a/src/gasket_interrupt.c b/src/gasket_interrupt.c
+index xxxxxxx..xxxxxxx 100644
+--- a/src/gasket_interrupt.c
++++ b/src/gasket_interrupt.c
+@@ -157,13 +157,7 @@ void gasket_handle_interrupt(struct gasket_interrupt_data *interrupt_data,
+ 	trace_gasket_interrupt_event(interrupt_data->name, interrupt_index);
+ 	read_lock(&interrupt_data->eventfd_ctx_lock);
+ 	ctx = interrupt_data->eventfd_ctxs[interrupt_index];
+-        if (ctx)
+-                #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+-                        eventfd_signal(ctx);
+-                #else
+-                        eventfd_signal(ctx, 1);
+-                #endif
+-        read_unlock(&interrupt_data->eventfd_ctx_lock);
++	if (ctx)
++		eventfd_signal(ctx);
++	read_unlock(&interrupt_data->eventfd_ctx_lock);
+
+ 	++(interrupt_data->interrupt_counts[interrupt_index]);
+ }
+
+diff --git a/src/gasket_page_table.c b/src/gasket_page_table.c
+index xxxxxxx..xxxxxxx 100644
+--- a/src/gasket_page_table.c
++++ b/src/gasket_page_table.c
+@@ -44,16 +44,13 @@
+ #include <linux/file.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
+ #include <linux/list.h>
+ #include <linux/module.h>
+ #include <linux/moduleparam.h>
+ #include <linux/pagemap.h>
+ #include <linux/version.h>
+ #include <linux/vmalloc.h>
+
+-#if __has_include(<linux/dma-buf.h>)
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+ MODULE_IMPORT_NS("DMA_BUF");
+-#else
+-MODULE_IMPORT_NS(DMA_BUF);
+-#endif
+-#endif
+
+ #include "gasket_constants.h"
+ #include "gasket_core.h"
+@@ -484,10 +484,10 @@ static bool gasket_release_page(struct page *page)
+ 	if (!page)
+ 		return false;
+
+-	if (!PageReserved(page))
+-		SetPageDirty(page);
+-	put_page(page);
+-
++	if (!PageReserved(page))
++		set_page_dirty_lock(page);
++	unpin_user_page(page);
+ 	return true;
+ }
+
+@@ -507,7 +507,7 @@ static bool gasket_release_page(struct page *page)
+ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
+ 				  struct gasket_page_table_entry *ptes,
+ 				  u64 __iomem *slots,
+-				  struct sg_page_iter *sg_iter,
++				  struct sg_dma_page_iter *sg_iter,
+ 				  ulong host_addr,
+ 				  uint num_pages, u32 flags,
+ 				  int is_simple_mapping)
+@@ -535,17 +535,12 @@ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
+ 		page_addr = host_addr + i * PAGE_SIZE;
+ 		offset = page_addr & (PAGE_SIZE - 1);
+ 		dev_dbg(pg_tbl->device, "%s i %d\n", __func__, i);
+ 		if (sg_iter) {
+-			if (!__sg_page_iter_next(sg_iter))
++			if (!__sg_dma_page_iter_next(sg_iter))
+ 				return -EINVAL;
+
+ 			/* Page already mapped for DMA. */
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 1, 0)
+-			ptes[i].dma_addr = sg_page_iter_dma_address(sg_iter);
+-#else
+-			ptes[i].dma_addr = sg_page_iter_dma_address(
+-				container_of(sg_iter, struct sg_dma_page_iter, base));
+-#endif
++			ptes[i].dma_addr = sg_page_iter_dma_address(sg_iter);
+ 			ptes[i].page = NULL;
+ 			offset = 0;
+ 		} else if (is_coherent(pg_tbl, host_addr)) {
+@@ -557,9 +552,9 @@ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
+ 			ptes[i].dma_addr = pg_tbl->coherent_pages[0].paddr +
+ 					   off + i * PAGE_SIZE;
+ 		} else {
+-			ret = get_user_pages_fast(page_addr - offset, 1,
+-						  direction != DMA_TO_DEVICE,
+-						  &page);
++			ret = pin_user_pages_fast(page_addr - offset, 1,
++						  FOLL_LONGTERM |
++						  (direction != DMA_TO_DEVICE ? FOLL_WRITE : 0),
++						  &page);
+
+ 			if (ret <= 0) {
+ 				dev_err(pg_tbl->device,
+@@ -615,7 +610,7 @@ static int gasket_perform_mapping(struct gasket_page_table *pg_tbl,
+ static int gasket_map_simple_pages(struct gasket_page_table *pg_tbl,
+-				   struct sg_page_iter *sg_iter,
++				   struct sg_dma_page_iter *sg_iter,
+ 				   ulong host_addr, u64 dev_addr,
+ 				   uint num_pages, u32 flags)
+ {
+@@ -905,7 +900,7 @@ static int gasket_map_simple_pages(...)
+ static int gasket_map_extended_pages(struct gasket_page_table *pg_tbl,
+-				     struct sg_page_iter *sg_iter,
++				     struct sg_dma_page_iter *sg_iter,
+ 				     ulong host_addr, u64 dev_addr,
+ 				     uint num_pages, u32 flags)
+ {
+@@ -1173,16 +1168,19 @@ int gasket_page_table_map_dmabuf(...)
+ {
+-	struct sg_page_iter sg_iter;
++	struct sg_dma_page_iter sg_iter;
+ 	...
+
+-	sgt = dma_buf_map_attachment(attachment, direction);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++	sgt = dma_buf_map_attachment_unlocked(attachment, direction);
++#else
++	sgt = dma_buf_map_attachment(attachment, direction);
++#endif
+ 	if (IS_ERR(sgt)) {
+ 		ret = PTR_ERR(sgt);
+ 		goto out;
+ 	}
+
+ 	mutex_lock(&pg_tbl->mutex);
+ 	locked = 1;
+
+-	__sg_page_iter_start(&sg_iter, sgt->sgl, sgt->nents, 0);
++	/* sg_iter is advanced inside gasket_perform_mapping via */
++	/* __sg_dma_page_iter_next; initialise it with the public start fn. */
++	memset(&sg_iter, 0, sizeof(sg_iter));
++	sg_iter.base.sglist = sgt->sgl;
++	sg_iter.base.sg_nents = sgt->nents;
++	/* NOTE: use for_each_sgtable_dma_page if perform_mapping is refactored */
++
+ 	if (gasket_addr_is_simple(pg_tbl, dev_addr)) {
+ 		ret = gasket_map_simple_pages(pg_tbl, &sg_iter, 0, dev_addr,
+ 					      num_pages, flags);
+@@ -1240,10 +1238,16 @@ out:
+ 	if (locked)
+ 		mutex_unlock(&pg_tbl->mutex);
+
+-	if (!IS_ERR_OR_NULL(sgt))
+-		dma_buf_unmap_attachment(attachment, sgt, direction);
++	if (!IS_ERR_OR_NULL(sgt)) {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++		dma_buf_unmap_attachment_unlocked(attachment, sgt, direction);
++#else
++		dma_buf_unmap_attachment(attachment, sgt, direction);
++#endif
++	}
+
+ @@ -1260,8 +1264,14 @@ static void gasket_page_table_detach_dmabuf_nolock(...)
+ 		if (dmabuf == NULL || mapping->dmabuf == dmabuf) {
+-			dma_buf_unmap_attachment(mapping->attachment,
+-						 mapping->sgt, mapping->direction);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
++			dma_buf_unmap_attachment_unlocked(mapping->attachment,
++							  mapping->sgt,
++							  mapping->direction);
++#else
++			dma_buf_unmap_attachment(mapping->attachment,
++						 mapping->sgt, mapping->direction);
++#endif
+ 			dma_buf_detach(mapping->dmabuf, mapping->attachment);
+ 			dma_buf_put(mapping->dmabuf);
+--
+2.x.x

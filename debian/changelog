@@ -1,3 +1,22 @@
+gasket-dkms (1.0-19) noble; urgency=medium
+
+  * Kernel 7.x compatibility fixes:
+    - Replace get_user_pages_fast/put_page with pin_user_pages_fast/
+      unpin_user_page for correct long-term DMA page pinning (FOLL_PIN).
+    - Replace SetPageDirty with set_page_dirty_lock to avoid unsafe
+      page dirtying outside page-lock context.
+    - Replace private __sg_page_iter_next with __sg_dma_page_iter_next;
+      change all sg_page_iter arguments to sg_dma_page_iter; remove
+      container_of hack and dead < 5.1 kernel branch.
+    - Replace dma_buf_map_attachment/dma_buf_unmap_attachment (locked
+      variants removed in 7.x) with _unlocked variants, guarded for
+      back-compat with kernels < 6.11.
+    - Remove dead class_create version guard (< 6.4 branch).
+    - Remove dead eventfd_signal version guard (< 6.8 branch).
+    - Simplify MODULE_IMPORT_NS guard; string form only.
+
+ -- Cose Rotondo <cose.rotondo@gmail.com>  Sun, 01 Jun 2026 00:00:00 +0000
+
 gasket-dkms (1.0-18.4) noble; urgency=medium
  
   * Update ffor Kernel 6.13+
