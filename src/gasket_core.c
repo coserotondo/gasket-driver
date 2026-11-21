@@ -919,10 +919,19 @@ int gasket_mm_unmap_region(const struct gasket_dev *gasket_dev,
 	 * PAGE_SIZE! Trust me. I have the scars.
 	 *
 	 * Next multiple of y: ceil_div(x, y) * y
+	 *
+	 * Kernel 7.1 replaced zap_vma_ptes() with zap_special_vma_range(),
+	 * which takes the same arguments and performs the same checks.
 	 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
+	zap_special_vma_range(vma, vma->vm_start + virt_offset,
+			      DIV_ROUND_UP(mappable_region.length_bytes,
+					   PAGE_SIZE) * PAGE_SIZE);
+#else
 	zap_vma_ptes(vma, vma->vm_start + virt_offset,
 		     DIV_ROUND_UP(mappable_region.length_bytes, PAGE_SIZE) *
 		     PAGE_SIZE);
+#endif
 	return 0;
 }
 EXPORT_SYMBOL(gasket_mm_unmap_region);
